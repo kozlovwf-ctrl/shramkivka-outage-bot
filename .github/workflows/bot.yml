@@ -19,6 +19,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main              # найсвіжіший state.json, а не той, що був на момент виклику
       - name: Bot
         run: python3 bot.py
         env:
