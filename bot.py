@@ -7,7 +7,7 @@
 Що робить:
   * закріплене повідомлення «🗓 Графік відключень» (сьогодні й завтра), редагується щоразу;
   * графік змінився або оприлюднили новий → статус перепубліковується знизу + «🗓 Оновлення графіка»;
-  * ⏰ нагадування за ~15–20 хв до відключення.
+  * ⏰ нагадування за ~30 хв до відключення.
 
 Секрети (змінні середовища, у GitHub — Settings → Secrets → Actions):
   TG_TOKEN — токен бота від @BotFather
@@ -36,7 +36,7 @@ except Exception:                       # Windows без пакета tzdata —
 API = "https://cabinet.cherkasyoblenergo.com/api_new/disconn.php"
 ADDRESS = os.environ.get("ADDRESS") or "с. Шрамківка, вул. Поштова, 5"
 STATE_FILE = os.environ.get("STATE_FILE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
-REMIND_MIN = 20        # cron раз на 10 хв, а GitHub ще й запізнюється, тож вікно з запасом
+REMIND_MIN = 35        # ~30 хв: cron раз на 10 хв, тож перший запуск у вікні 25–35 хв до початку
 STALE_H = 3            # сайт мовчить довше — попередження в статусі
 DRY = "--dry" in sys.argv
 
