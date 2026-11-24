@@ -1,0 +1,33 @@
+name: shramkivka-bot
+
+on:
+  schedule:
+    # Раз на 10 хв, зі зсувом від :00: о початку години GitHub перевантажений і запускає з запізненням
+    - cron: "4,14,24,34,44,54 * * * *"
+  workflow_dispatch: {}          # кнопка «Run workflow» для ручного запуску
+
+permissions:
+  contents: write                # щоб закомітити state.json
+
+concurrency:                     # два запуски одночасно не повинні писати state.json
+  group: bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bot
+        run: python3 bot.py
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+          ABON_LS: ${{ secrets.ABON_LS }}
+      - name: Save state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || (git commit -q -m "state" && git push -q)
