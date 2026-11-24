@@ -19,6 +19,7 @@
 import json
 import os
 import re
+import ssl
 import sys
 import time
 import urllib.error
@@ -51,13 +52,23 @@ KIND_TITLE = {KIND_AVAR: "⚠️ Аварійне відключення", KIND_
 
 # ---------- Черкасиобленерго ----------
 
+# Сайт обленерго не віддає проміжний сертифікат Sectigo (Windows і браузери докачують його самі,
+# Linux на GitHub — ні: CERTIFICATE_VERIFY_FAILED). Тому він лежить поруч (дійсний до 2036).
+SSL_CTX = ssl.create_default_context()
+try:
+    SSL_CTX.load_verify_locations(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sectigo_dv_r36.pem"))
+    SSL_CTX.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
+except Exception as e:
+    print("Сертифікат Sectigo не завантажено:", e)
+
+
 def api(params):
     url = API + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     err = None
     for attempt in range(3):
         try:
-            with urllib.request.urlopen(req, timeout=40) as r:
+            with urllib.request.urlopen(req, timeout=40, context=SSL_CTX) as r:
                 return json.loads(r.read().decode("utf-8-sig"))
         except Exception as e:          # URL не друкуємо: у ньому особовий рахунок
             err = f"{type(e).__name__}: {getattr(e, 'code', '') or getattr(e, 'reason', '')}"
