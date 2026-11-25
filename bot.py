@@ -140,26 +140,47 @@ def parse_article(page):
 
 
 def news_schedule(now, queue):
-    """{дата: [(start, end)]} для черги з новин обленерго. Список новин — найновіші зверху,
-    тож перша знайдена новина на дату (у т.ч. «Оновлено графік…») і є актуальною."""
+    """{дата: [(start, end)]} для черги з новин обленерго. Список новин — найновіші зверху.
+    «Оновлено графік…», опублікований увечері, містить лише години після оновлення (25.11 о 21:17 —
+    лише з 18:00), тож найновіша новина діє повністю, а зі старших беремо проміжки,
+    що почались до публікації новішої."""
     page = get_text(SITE + "/media?lang=uk")
-    found = {}
+    arts, seen = {}, set()          # дата → [(час публікації, href)], найновіші першими
     for m in re.finditer(r'href="(/media/[^"]*hpv[^"]*)"', page):
+        if m.group(1) in seen:
+            continue
         title = html.unescape(re.sub(r"<[^>]+>", " ", page[m.end():m.end() + 500]))
         mt = re.search(r"\(ГПВ\)\s*на\s*(\d{1,2})\s+([а-яіїє]+)", title)
         if not mt or mt.group(2) not in MONTHS:
             continue
+        seen.add(m.group(1))
         mo, d = MONTHS.index(mt.group(2)) + 1, int(mt.group(1))
         y = now.year + (1 if mo < now.month - 6 else -1 if mo > now.month + 6 else 0)
         day = datetime(y, mo, d, tzinfo=KYIV)
-        if day.date() in found or not (now.date() <= day.date() <= (now + timedelta(days=1)).date()):
+        if not (now.date() <= day.date() <= (now + timedelta(days=1)).date()):
             continue
-        sched = parse_article(get_text(SITE + m.group(1)))
-        if sched is None:
-            print("Не розібрано новину", m.group(1))
-            continue
-        found[day.date()] = merge([(day + timedelta(minutes=a), day + timedelta(minutes=b))
-                                   for a, b in sched.get(queue, []) if b > a])
+        mp = re.search(r"(\d{2})\.(\d{2})\.(\d{4})\s+(\d{1,2}):(\d{2})", title[mt.end():])
+        pub = (datetime(int(mp.group(3)), int(mp.group(2)), int(mp.group(1)), int(mp.group(4)),
+                        int(mp.group(5)), tzinfo=KYIV) if mp else None)
+        arts.setdefault(day, []).append((pub, m.group(1)))
+
+    found = {}
+    for day, lst in arts.items():
+        slots, cutoff = [], None
+        for pub, href in lst:
+            sched = parse_article(get_text(SITE + href))
+            if sched is None:
+                print("Не розібрано новину", href)
+                continue
+            iv = [(day + timedelta(minutes=a), day + timedelta(minutes=b))
+                  for a, b in sched.get(queue, []) if b > a]
+            slots += iv if cutoff is None else [x for x in iv if x[0] < cutoff]
+            if pub is None:
+                break                   # не знаємо, коли вийшла — старші не чіпаємо
+            cutoff = pub
+            if cutoff <= day:           # оновлення вийшло до початку доби — старші вже неактуальні
+                break
+        found[day.date()] = merge(slots)
     return found
 
 
@@ -294,6 +315,8 @@ def status_body(data, now):
 
     # 1. Головне — одним рядком: є світло чи ні і до коли
     active = [f for f in data["facts"] if f[2] == "active" and now < f[1] + timedelta(minutes=30)]
+    if data["official"]:   # записи за рахунком містять і чужу чергу (5.1) — лише ті, що збігаються з нашим графіком
+        active = [f for f in active if any(fact_for(s, e, [f]) for s, e in data["plan"][KIND_GPV])]
     cur = [(s, e) for s, e in allplan if s <= now < e]
     if active or cur:
         end = max([e for _, e in cur] or [active[0][1]])
