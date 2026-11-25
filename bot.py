@@ -16,6 +16,7 @@
 
 Локальна перевірка без Telegram:  python bot.py --dry
 """
+import html
 import json
 import os
 import re
@@ -33,6 +34,7 @@ try:
 except Exception:                       # Windows без пакета tzdata — лише для локальної перевірки
     KYIV = timezone(timedelta(hours=2))
 
+SITE = "https://cherkasyoblenergo.com"
 API = "https://cabinet.cherkasyoblenergo.com/api_new/disconn.php"
 ADDRESS = os.environ.get("ADDRESS") or "с. Шрамківка, вул. Поштова, 5"
 STATE_FILE = os.environ.get("STATE_FILE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
@@ -98,11 +100,74 @@ def merge(iv):
     return [tuple(x) for x in out]
 
 
+def get_text(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    err = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=40, context=SSL_CTX) as r:
+                return r.read().decode("utf-8", "ignore")
+        except Exception as e:
+            err = f"{type(e).__name__}: {getattr(e, 'code', '') or getattr(e, 'reason', '')}"
+            time.sleep(5 * (attempt + 1))
+    raise RuntimeError(err)
+
+
+TIME_RX = re.compile(r"(\d{1,2})\s*:\s*(\d{2})\s*[-–—]\s*(\d{1,2})\s*:\s*(\d{2})")
+
+
+def parse_article(page):
+    """Новина «Графік погодинних відключень (ГПВ) на 25 листопада»:
+    «1.1 08:00 - 10:00, 12:00 - 15:00, 18:00 - 20:00  1.2 …» → {"1.1": [(480, 600), …]} у хвилинах."""
+    t = re.sub(r"<script.*?</script>|<style.*?</style>", "", page, flags=re.S | re.I)
+    i = t.find("Години відсутності")
+    if i < 0:
+        return None
+    t = t[i:]
+    j = t.find("Повернутись до новин")
+    t = t[:j] if j > 0 else t[:30000]
+    # блочні теги → пробіл, решта → нічого (на сайті «08</strong>:00» розірване тегом)
+    t = re.sub(r"<\s*/?\s*(p|br|div|li|tr|td|h\d)\b[^>]*>", " ", t, flags=re.I)
+    x = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", t)))
+    parts = re.split(r"(?<![\d:.])\b([1-6]\.[12])\b(?![.\d])", x)
+    out = {}
+    for q, seg in zip(parts[1::2], parts[2::2]):
+        out.setdefault(q, [])
+        for h1, m1, h2, m2 in TIME_RX.findall(seg):
+            out[q].append((int(h1) * 60 + int(m1), int(h2) * 60 + int(m2)))
+    return out if len(out) >= 6 else None      # менше черг — значить, формат змінився
+
+
+def news_schedule(now, queue):
+    """{дата: [(start, end)]} для черги з новин обленерго. Список новин — найновіші зверху,
+    тож перша знайдена новина на дату (у т.ч. «Оновлено графік…») і є актуальною."""
+    page = get_text(SITE + "/media?lang=uk")
+    found = {}
+    for m in re.finditer(r'href="(/media/[^"]*hpv[^"]*)"', page):
+        title = html.unescape(re.sub(r"<[^>]+>", " ", page[m.end():m.end() + 500]))
+        mt = re.search(r"\(ГПВ\)\s*на\s*(\d{1,2})\s+([а-яіїє]+)", title)
+        if not mt or mt.group(2) not in MONTHS:
+            continue
+        mo, d = MONTHS.index(mt.group(2)) + 1, int(mt.group(1))
+        y = now.year + (1 if mo < now.month - 6 else -1 if mo > now.month + 6 else 0)
+        day = datetime(y, mo, d, tzinfo=KYIV)
+        if day.date() in found or not (now.date() <= day.date() <= (now + timedelta(days=1)).date()):
+            continue
+        sched = parse_article(get_text(SITE + m.group(1)))
+        if sched is None:
+            print("Не розібрано новину", m.group(1))
+            continue
+        found[day.date()] = merge([(day + timedelta(minutes=a), day + timedelta(minutes=b))
+                                   for a, b in sched.get(queue, []) if b > a])
+    return found
+
+
 def fetch(now):
     d0 = (now - timedelta(days=1)).strftime("%d.%m.%Y")
     d1 = (now + timedelta(days=1)).strftime("%d.%m.%Y")
     base = {"op": "disconn_by_ls", "n_date": d0, "k_date": d1, "abon_ls": LS}
-    data = {"queue": "", "avar_queue": "", "done": [], "plan": {KIND_GPV: [], KIND_AVAR: [], KIND_WORKS: []}}
+    data = {"queue": "", "avar_queue": "", "done": [], "facts": [], "days": set(), "official": False,
+            "plan": {KIND_GPV: [], KIND_AVAR: [], KIND_WORKS: []}}
     for sel, kind in (("2", KIND_GPV), ("1", KIND_AVAR), ("0", KIND_WORKS)):
         j = api(dict(base, disconn_selector=sel))
         for q in j.get("DISCONN_QUEUQ") or []:
@@ -121,11 +186,28 @@ def fetch(now):
                 continue
             if "заверш" in st:
                 data["done"].append((s, e))          # фактичний час
-            else:
-                data["plan"][kind].append((s, e))    # очікується / триває
+                if kind == KIND_GPV:
+                    data["facts"].append((s, e, "done"))
+            elif "очіку" in st or "заплан" in st:
+                data["plan"][kind].append((s, e))
+            else:                                    # «Застосовано»: вимкнули, початок фактичний
+                data["plan"][kind].append((s, e))
+                if kind == KIND_GPV:
+                    data["facts"].append((s, e, "active"))
     data["done"] = merge(data["done"])
     for k in data["plan"]:
         data["plan"][k] = merge(data["plan"][k])
+
+    # Записи за особовим рахунком містять і чужу чергу (вулицю живлять дві лінії: 1.1 і 5.1),
+    # тому години відключень беремо з офіційного графіка черг у новинах, а записи — лише як факт.
+    if data["queue"]:
+        try:
+            news = news_schedule(now, data["queue"])
+            data["plan"][KIND_GPV] = sorted(x for lst in news.values() for x in lst)
+            data["days"] = set(news)
+            data["official"] = True
+        except Exception as e:
+            print("Новини обленерго недоступні, графік за особовим рахунком:", e)
     return data
 
 
@@ -141,9 +223,42 @@ def dur(s, e):
     return ((f"{h} год " if h else "") + (f"{m} хв" if m or not h else "")).strip()
 
 
+def fact_for(s, e, facts):
+    """Фактичний запис, що відповідає проміжку графіка: перекриття ≥ половини коротшого,
+    найближчий за початком. Так запис чужої черги (21:00–23:10 проти 23:00–24:00) не чіпляється."""
+    best = None
+    for fs, fe, kind in facts:
+        ov = (min(e, fe) - max(s, fs)).total_seconds()
+        if ov <= 0 or ov < 0.5 * min((e - s), (fe - fs)).total_seconds():
+            continue
+        if best is None or abs(fs - s) < abs(best[0] - s):
+            best = (fs, fe, kind)
+    return best
+
+
 def day_lines(day, data, now):
-    """Відключення через північ — під днем початку. Але сьогоднішній список показує
-    і хвіст учорашнього (обрізаний з 00:00), інакше ранкові години без світла зникли б."""
+    if data["official"]:
+        if day not in data["days"]:
+            return None
+        lines = []
+        for s, e in data["plan"][KIND_GPV]:
+            if s.date() != day:
+                continue
+            span = f"{hm(s)}–{hm(e)}"
+            f = fact_for(s, e, data["facts"])
+            if f and f[2] == "done":
+                lines.append(f"<s>{span}</s> · фактично {hm(f[0])}–{hm(f[1])}")
+            elif f and f[2] == "active" and now < e + timedelta(minutes=30):
+                lines.append(f"<b>{span}</b> ← зараз · вимкнули о {hm(f[0])}")
+            elif e <= now:
+                lines.append(f"<s>{span}</s>")
+            elif s <= now:
+                lines.append(f"<b>{span}</b> ({dur(s, e)}) ← зараз")
+            else:
+                lines.append(f"{span} ({dur(s, e)})")
+        return lines
+    # Запасний шлях: лише записи за особовим рахунком (злиті, можуть містити чужу чергу).
+    # Відключення через північ — під днем початку, а сьогоднішній список показує й хвіст учорашнього.
     start = datetime(day.year, day.month, day.day, tzinfo=KYIV)
     clip = day == now.date()
     items = []
@@ -168,15 +283,21 @@ def day_lines(day, data, now):
 def status_body(data, now):
     today, tomorrow = now.date(), (now + timedelta(days=1)).date()
     q = f" · черга {data['queue']}" if data["queue"] else ""
-    off_now = any(s <= now < e for s, e in data["plan"][KIND_GPV])
     t = "🗓 <b>Графік відключень</b>\n"
     t += f"📍 {ADDRESS}{q}\n"
-    t += ("❌ Зараз за графіком світла немає\n" if off_now else "")
+    active = [f for f in data["facts"] if f[2] == "active" and now < f[1] + timedelta(minutes=30)]
+    if active:
+        t += f"❌ Світло вимкнули о {hm(active[0][0])}\n"
+    elif any(s <= now < e for s, e in data["plan"][KIND_GPV]):
+        t += "❌ Зараз за графіком світла немає\n"
     blk = []
     for label, day in (("Сьогодні", today), ("Завтра", tomorrow)):
         blk.append(f"{label}, {day.day} {MONTHS[day.month - 1]}:")
         ls = day_lines(day, data, now)
-        blk += ls or ["відключень поки не заплановано"]
+        if ls is None:
+            blk.append("графік ще не оприлюднено")
+        else:
+            blk += ls or ["відключень немає" if data["official"] else "відключень поки не заплановано"]
     t += "<blockquote>" + "\n".join(blk) + "</blockquote>"
     for kind in (KIND_AVAR, KIND_WORKS):
         for s, e in data["plan"][kind]:
