@@ -435,7 +435,7 @@ def main():
     changed = "future" in st and fut != prev
     st["future"] = fut
 
-    if changed or not st.get("pin_id"):
+    if changed or not st.get("pin_id") or os.environ.get("REPOST") == "true":
         ok = post_status(st, text)
         if changed and ok:
             send("🗓 <b>Графік змінився</b>\nНовий графік — вище ⬆️")

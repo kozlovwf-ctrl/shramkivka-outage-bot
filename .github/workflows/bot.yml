@@ -4,7 +4,12 @@ on:
   schedule:
     # Раз на 10 хв, зі зсувом від :00: о початку години GitHub перевантажений і запускає з запізненням
     - cron: "4,14,24,34,44,54 * * * *"
-  workflow_dispatch: {}          # кнопка «Run workflow» для ручного запуску
+  workflow_dispatch:             # кнопка «Run workflow» для ручного запуску
+    inputs:
+      repost:
+        description: "Надіслати статус заново (внизу чату)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write                # щоб закомітити state.json
@@ -27,6 +32,7 @@ jobs:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT }}
           ABON_LS: ${{ secrets.ABON_LS }}
+          REPOST: ${{ inputs.repost }}
       - name: Save state
         run: |
           git config user.name "github-actions[bot]"
