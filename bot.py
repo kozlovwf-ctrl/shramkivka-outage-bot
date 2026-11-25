@@ -48,6 +48,7 @@ LS = os.environ.get("ABON_LS", "")
 
 MONTHS = ["січня", "лютого", "березня", "квітня", "травня", "червня", "липня",
           "серпня", "вересня", "жовтня", "листопада", "грудня"]
+WEEKDAYS = ["понеділок", "вівторок", "середа", "четвер", "п'ятниця", "субота", "неділя"]
 KIND_GPV, KIND_AVAR, KIND_WORKS = "gpv", "avar", "works"
 KIND_TITLE = {KIND_AVAR: "⚠️ Аварійне відключення", KIND_WORKS: "🔧 Планові роботи"}
 
@@ -244,18 +245,11 @@ def day_lines(day, data, now):
         for s, e in data["plan"][KIND_GPV]:
             if s.date() != day:
                 continue
-            span = f"{hm(s)}–{hm(e)}"
             f = fact_for(s, e, data["facts"])
-            if f and f[2] == "done":
-                lines.append(f"<s>{span}</s> · фактично {hm(f[0])}–{hm(f[1])}")
-            elif f and f[2] == "active" and now < e + timedelta(minutes=30):
-                lines.append(f"<b>{span}</b> ← зараз · вимкнули о {hm(f[0])}")
-            elif e <= now:
-                lines.append(f"<s>{span}</s>")
-            elif s <= now:
-                lines.append(f"<b>{span}</b> ({dur(s, e)}) ← зараз")
+            if f and f[2] == "active" and now < e + timedelta(minutes=30):
+                lines.append(slot_line(s, e, now, now_off=True))
             else:
-                lines.append(f"{span} ({dur(s, e)})")
+                lines.append(slot_line(s, e, now, done=bool(f and f[2] == "done")))
         return lines
     # Запасний шлях: лише записи за особовим рахунком (злиті, можуть містити чужу чергу).
     # Відключення через північ — під днем початку, а сьогоднішній список показує й хвіст учорашнього.
@@ -268,51 +262,75 @@ def day_lines(day, data, now):
                 items.append((s, e, done))
             elif clip and s < start < e:
                 items.append((start, e, done))
-    lines = []
-    for s, e, done in sorted(items):
-        span = f"{hm(s)}–{hm(e)}"
-        if done or e <= now:
-            lines.append(f"<s>{span}</s>")
-        elif s <= now:
-            lines.append(f"<b>{span}</b> ({dur(s, e)}) ← зараз")
-        else:
-            lines.append(f"{span} ({dur(s, e)})")
-    return lines
+    return [slot_line(s, e, now, done=done) for s, e, done in sorted(items)]
+
+
+def slot_line(s, e, now, done=False, now_off=False):
+    """Один проміжок без світла: значок + жирний час; минулий — закреслений."""
+    span = f"{hm(s)} – {hm(e)}"
+    if now_off or (not done and s <= now < e):
+        return f"🔴 <b>{span}</b>  ← ЗАРАЗ"
+    if done or e <= now:
+        return f"✔️ <s>{span}</s>  (минуло)"
+    return f"⚫️ <b>{span}</b>  ({dur(s, e)})"
+
+
+def day_title(label, day):
+    return f"<b>{label}, {WEEKDAYS[day.weekday()]}, {day.day} {MONTHS[day.month - 1]}</b>"
+
+
+def when(t, now):
+    d = t.date()
+    if d == now.date():
+        return f"сьогодні о {hm(t)}"
+    if d == (now + timedelta(days=1)).date():
+        return f"завтра о {hm(t)}"
+    return f"{t.day} {MONTHS[t.month - 1]} о {hm(t)}"
 
 
 def status_body(data, now):
     today, tomorrow = now.date(), (now + timedelta(days=1)).date()
-    q = f" · черга {data['queue']}" if data["queue"] else ""
-    t = "🗓 <b>Графік відключень</b>\n"
-    t += f"📍 {ADDRESS}{q}\n"
+    allplan = [x for lst in data["plan"].values() for x in lst]
+
+    # 1. Головне — одним рядком: є світло чи ні і до коли
     active = [f for f in data["facts"] if f[2] == "active" and now < f[1] + timedelta(minutes=30)]
-    if active:
-        t += f"❌ Світло вимкнули о {hm(active[0][0])}\n"
-    elif any(s <= now < e for s, e in data["plan"][KIND_GPV]):
-        t += "❌ Зараз за графіком світла немає\n"
-    blk = []
+    cur = [(s, e) for s, e in allplan if s <= now < e]
+    if active or cur:
+        end = max([e for _, e in cur] or [active[0][1]])
+        t = "❌ <b>ЗАРАЗ СВІТЛА НЕМАЄ</b>\n"
+        if active:
+            t += f"Вимкнули о {hm(active[0][0])}\n"
+        t += f"За графіком увімкнуть <b>{when(end, now)}</b>\n"
+    else:
+        t = "💡 <b>Зараз світло є</b>  (за графіком)\n"
+        nxt = min((s for s, _ in allplan if s > now), default=None)
+        if nxt:
+            t += f"Наступне вимкнення: <b>{when(nxt, now)}</b>\n"
+        else:
+            t += "Вимкнень поки не заплановано\n"
+
+    # 2. Графік по днях
     for label, day in (("Сьогодні", today), ("Завтра", tomorrow)):
-        blk.append(f"{label}, {day.day} {MONTHS[day.month - 1]}:")
+        t += f"\n{day_title(label, day)}\n"
         ls = day_lines(day, data, now)
         if ls is None:
-            blk.append("графік ще не оприлюднено")
+            t += "графік ще не оприлюднено\n"
         else:
-            blk += ls or ["відключень немає" if data["official"] else "відключень поки не заплановано"]
-    t += "<blockquote>" + "\n".join(blk) + "</blockquote>"
+            t += "\n".join(ls or ["✅ вимкнень немає" if data["official"] else "вимкнень поки не заплановано"]) + "\n"
+
     for kind in (KIND_AVAR, KIND_WORKS):
         for s, e in data["plan"][kind]:
             if e > now:
-                t += f"\n{KIND_TITLE[kind]}: {s.strftime('%d.%m %H:%M')} – {e.strftime('%d.%m %H:%M')}"
-    if data["avar_queue"]:
-        t += f"\n<i>Аварійна черга {data['avar_queue']}</i>"
-    return t
+                t += f"\n{KIND_TITLE[kind]}:\n<b>{s.strftime('%d.%m %H:%M')} – {e.strftime('%d.%m %H:%M')}</b>\n"
+    return t.rstrip()
 
 
 def footer(st, now):
     ok = st.get("last_ok")
     if ok and now - datetime.fromisoformat(ok) > timedelta(hours=STALE_H):
         return f"\n\n⚠️ <i>Сайт обленерго не відповідає з {datetime.fromisoformat(ok).strftime('%H:%M %d.%m')}, графік може бути неактуальним</i>"
-    return f"\n\n<i>Оновлено {hm(now)} · дані Черкасиобленерго</i>"
+    q = st.get("queue")
+    return f"\n\n<i>{ADDRESS}" + (f", черга {q}" if q else "") + f"\nОновлено о {hm(now)}</i>"
 
 
 # ---------- Telegram ----------
@@ -406,6 +424,7 @@ def main():
         save(st)
         return
     st["last_ok"] = now.isoformat()
+    st["queue"] = data["queue"]
 
     body = status_body(data, now)
     text = body + footer(st, now)
@@ -419,7 +438,7 @@ def main():
     if changed or not st.get("pin_id"):
         ok = post_status(st, text)
         if changed and ok:
-            send("🗓 <b>Оновлення графіка відключень</b>\nАктуальний графік — вище ⬆️")
+            send("🗓 <b>Графік змінився</b>\nНовий графік — вище ⬆️")
     else:
         edit_status(st, text)
     st["body"] = body
@@ -431,9 +450,10 @@ def main():
         for s, e in lst:
             left = (s - now).total_seconds() / 60
             if 0 < left <= REMIND_MIN and s.isoformat() not in reminded:
-                title = "Відключення за графіком" if kind == KIND_GPV else KIND_TITLE[kind]
-                send(f"⏰ <b>{title} о {hm(s)}</b> (за {int(left)} хв)\n"
-                     f"Світла не буде до {hm(e)} ({dur(s, e)})", silent=night)
+                title = "" if kind == KIND_GPV else f"\n{KIND_TITLE[kind]}"
+                send(f"⏰ <b>О {hm(s)} ВИМКНУТЬ СВІТЛО</b>{title}\n"
+                     f"Через {int(left)} хв\n"
+                     f"Світла не буде до <b>{hm(e)}</b> ({dur(s, e)})", silent=night)
                 reminded.append(s.isoformat())
     st["reminded"] = reminded
     save(st)
